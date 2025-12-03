@@ -21,14 +21,13 @@ logger = logging.getLogger(__name__)
 
 SHARE_DB_FILE = "shared_messages.json"
 
-# *** Global olarak zamanlayıcıyı tanımlıyoruz. ***
+# *** ÇÖZÜM: Scheduler'ı global alanda tanımlıyoruz. ***
 global_scheduler = AsyncIOScheduler()
 
 # *** ÖNEMLİ: Kendi mesaj ID'lerinizle doldurun! ***
 ALL_MESSAGE_IDS = [100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110] 
 
 # --- 2. VERİTABANI İŞLEMLERİ (JSON) ---
-# (Bu kısım aynı kalabilir)
 def load_shared_messages():
     if not os.path.exists(SHARE_DB_FILE):
         return []
@@ -46,7 +45,6 @@ def save_shared_message(message_id):
             json.dump(shared_ids, f, indent=4)
 
 # --- 3. İÇERİK TEMİZLEME FONKSİYONU ---
-# (Bu kısım aynı kalabilir)
 def clean_caption_text(text: str) -> str:
     if not text:
         return ""
@@ -81,13 +79,13 @@ async def transfer_content(application: Application, is_test=False):
     message_to_share_id = random.choice(unshared_ids)
     
     try:
-        # Mesajı kopyalama (Link/Kullanıcı adı temizliği için 'caption' yerine sadece bu metni kullan)
         await bot.copy_message(
             chat_id=TARGET_CHANNEL_ID,
             from_chat_id=SOURCE_CHANNEL_ID,
             message_id=message_to_share_id,
-            # NOT: Bu, orijinal caption'ı kaybeder. Gerçek temizlik için Telethon önerilir.
-            caption="Yeni bir içerik paylaşıldı!", 
+            # NOT: Bu kopyalama, orijinal metindeki link ve kullanıcı adlarını koruyabilir.
+            # Kesin temizlik için sadece yeni bir metin/caption gönderilir.
+            caption="Yeni bir içerik paylaşıldı! (Eski linkler kaldırıldı)", 
         )
         
         save_shared_message(message_to_share_id)
@@ -99,7 +97,6 @@ async def transfer_content(application: Application, is_test=False):
 # --- 5. TELEGRAM KOMUTLARI (TEST MODU) ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Bota /start komutu ile ilk mesajı gönderir."""
     await update.message.reply_text(
         "🤖 Bot başlatıldı ve zamanlayıcı kuruldu.\n"
         "⏰ Paylaşım saatleri: **12:00 - 19:00** arası.\n"
@@ -107,12 +104,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def test_paylasim_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/test_paylasim komutu ile hemen bir paylaşım denemesi yapar."""
     await update.message.reply_text("Test paylaşımı başlatılıyor. Lütfen hedef kanalı kontrol edin...")
-    
-    # Test Modunda, is_test=True olarak ana fonksiyonu çağır
     await transfer_content(context.application, is_test=True)
-    
     await update.message.reply_text("Test paylaşım işlemi tamamlandı.")
 
 
@@ -121,23 +114,26 @@ async def test_paylasim_command(update: Update, context: ContextTypes.DEFAULT_TY
 def start_scheduler(application: Application):
     """APScheduler'ı kurar ve paylaşım görevini global zamanlayıcıya ekler."""
     
-    # Önceki hatalı işleri temizle
-    if global_scheduler.running:
-        global_scheduler.remove_all_jobs()
+    # Yeni iş eklemeden önce varsa aynı ID'li işi kaldırıyoruz.
+    try:
+        global_scheduler.remove_job('hourly_transfer')
+    except Exception: # JobLookupError veya başka hataları yakala
+        pass 
 
     global_scheduler.add_job(
         transfer_content, 
         'cron', 
-        hour='12-18', # 12:00'dan başlayıp, 18:00'da son kez çalışacak
+        hour='12-18', 
         minute=0, 
         args=[application], 
         id='hourly_transfer', 
         replace_existing=True
     )
     
-    logger.info("Zamanlayıcı başlatıldı. Görev her saat başı 12:00-18:00 arasında çalışacak.")
+    logger.info("Zamanlayıcı görev eklendi.")
     if not global_scheduler.running:
         global_scheduler.start()
+        logger.info("Zamanlayıcı başlatıldı.")
 
 
 # --- 7. ANA ÇALIŞTIRMA FONKSİYONU ---
@@ -156,13 +152,13 @@ def main():
     application.add_handler(CommandHandler("test_paylasim", test_paylasim_command))
 
     # Zamanlayıcıyı başlat
+    # Bu fonksiyon sadece işleri ekleyip global zamanlayıcıyı başlatır.
     start_scheduler(application)
 
     logger.info("✅ Bot çalışıyor...")
-    # Polling başlatılıyor. Bu satır kodun burada kalmasını sağlar.
+    # Botu sonsuz döngüde çalıştırmak için Polling'i başlat.
     application.run_polling(poll_interval=1)
 
 if __name__ == "__main__":
-    # Kodun sadece bir kez çalıştırılmasını sağlamak için kontrol
     main()
-
+    
