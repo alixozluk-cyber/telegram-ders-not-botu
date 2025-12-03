@@ -3,13 +3,12 @@ import os
 import json
 import random
 import re
-from datetime import datetime
+from datetime import datetime, time
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from telegram.ext import Application, CommandHandler, ContextTypes, JobQueue
 
 # --- 1. AYARLAR VE LOGLAMA ---
-# Railway'den ortam değişkenlerini oku
+# Railway'den ortam değişkenlerini oku (Değerler atanmış olmalı!)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 SOURCE_CHANNEL_ID = os.environ.get("SOURCE_CHANNEL_ID")
 TARGET_CHANNEL_ID = os.environ.get("TARGET_CHANNEL_ID") 
@@ -21,11 +20,7 @@ logger = logging.getLogger(__name__)
 
 SHARE_DB_FILE = "shared_messages.json"
 
-# *** ÇÖZÜM: Global zamanlayıcı tek bir yerde tanımlanır. (AttributeError'ı çözer) ***
-global_scheduler = AsyncIOScheduler()
-
-# *** Lütfen burayı kendi kanalınızdaki mesaj ID'leriyle doldurun! ***
-# Bot, bu ID'ler arasından rastgele seçecektir.
+# *** ÖNEMLİ: Kendi mesaj ID'lerinizle doldurun! ***
 ALL_MESSAGE_IDS = [100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110] 
 
 # --- 2. VERİTABANI İŞLEMLERİ (JSON) ---
@@ -48,39 +43,40 @@ def save_shared_message(message_id):
         with open(SHARE_DB_FILE, 'w', encoding='utf-8') as f:
             json.dump(shared_ids, f, indent=4)
 
-# --- 3. İÇERİK TEMİZLEME FONKSİYONU ---
-# Bu fonksiyon, basitlik ve çalışma önceliği için şu an sadece uyarı amaçlı kullanılacaktır.
+# --- 3. İÇERİK TEMİZLEME FONKSİYONU (Basit hali) ---
 
-def get_cleaned_caption(original_caption: str) -> str:
+def clean_caption_text(text: str) -> str:
     """Metindeki linkleri ve kullanıcı adlarını siler ve yeni caption oluşturur."""
-    if not original_caption:
+    if not text:
         return "Yeni bir içerik paylaşıldı."
 
-    # Linkleri ve kullanıcı adlarını tespit eden Regex
     url_pattern = r'https?://\S+|www\.\S+|\w+\.(com|net|org|io|me|co|tr)'
     username_pattern = r'@\w+'
 
-    # Linkleri ve kullanıcı adlarını temizle (boşlukla değiştir)
-    cleaned_text = re.sub(url_pattern, '', original_caption, flags=re.IGNORECASE)
+    cleaned_text = re.sub(url_pattern, '', text, flags=re.IGNORECASE)
     cleaned_text = re.sub(username_pattern, '', cleaned_text)
     
-    # Fazla boşlukları temizle ve bir uyarı ekle
     final_caption = re.sub(r'\s+', ' ', cleaned_text).strip()
-    return final_caption + "\n\n(Bu içerik, bot tarafından temizlenerek yeniden paylaşıldı.)"
+    return final_caption + "\n\n(Bot tarafından temizlenmiştir.)"
+
 
 # --- 4. ANA İŞLEV: İÇERİK TRANSFERİ ---
 
-async def transfer_content(application: Application, is_test=False):
+async def transfer_content(context: ContextTypes.DEFAULT_TYPE, is_test=False):
     """
     Kaynak kanaldan bir mesajı rastgele seçer, temizler ve hedef kanala gönderir.
+    Bu fonksiyon artık hem zamanlayıcı hem de test modu tarafından çağrılabilir.
     """
-    current_hour = datetime.now().hour
-    # Saati 12:00'dan 18:59'a kadar kontrol eder
-    if not is_test and not (12 <= current_hour < 19):
-        logger.info("Saat kontrolü: %d. Paylaşım aralığı (12:00-19:00) dışında.", current_hour)
-        return
+    
+    # Zamanlayıcıdan geliyorsa ve test modu değilse saat kontrolü yap
+    if not is_test:
+        current_time = datetime.now().time()
+        # 12:00:00 ile 18:59:59 arası kontrol
+        if not (time(12, 0) <= current_time < time(19, 0)):
+            logger.info("Saat kontrolü: %s. Paylaşım aralığı (12:00-19:00) dışında.", current_time.strftime('%H:%M'))
+            return
 
-    bot = application.bot
+    bot = context.bot
     shared_ids = load_shared_messages()
     logger.info("Mesaj aranıyor... Test modu: %s", is_test)
     
@@ -93,17 +89,14 @@ async def transfer_content(application: Application, is_test=False):
     message_to_share_id = random.choice(unshared_ids)
     
     try:
-        # Mesaj detaylarını alma (copy_message metni temizlemek için yeterli değil)
-        # Bu kısım, kopyalanan mesajın metnini/başlığını *elde edemediğimiz* için 
-        # sadece temizlenmiş bir *yeni* başlık göndermeye odaklanıyor.
-        
-        # Orijinal mesaj başlığını (caption/text) çekmek için daha karmaşık yöntemler
-        # gerektiğinden, botun çalışırlığını sağlamak için basit bir caption gönderiyoruz.
+        # copy_message, orijinal mesajın metnini/başlığını *elde etmemize* izin vermez.
+        # Bu nedenle, sadece temizlenmiş bir *yeni* başlık gönderiyoruz.
         
         await bot.copy_message(
             chat_id=TARGET_CHANNEL_ID,
             from_chat_id=SOURCE_CHANNEL_ID,
             message_id=message_to_share_id,
+            # NOT: Temizleme, orijinal metin yerine yeni, statik bir caption göndererek garanti altına alınır.
             caption="Yeni bir içerik paylaşıldı! (Linkler ve kullanıcı adları silinmiştir)", 
         )
         
@@ -117,42 +110,38 @@ async def transfer_content(application: Application, is_test=False):
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 Bot başlatıldı ve zamanlayıcı kuruldu.\n"
+        "🤖 Bot başlatıldı ve zamanlayıcı (dakikalık kontrol) kuruldu.\n"
         "⏰ Paylaşım saatleri: **12:00 - 19:00** arası.\n"
         "🧪 Test modu için: `/test_paylasim`"
     )
 
 async def test_paylasim_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Test paylaşımı başlatılıyor. Lütfen hedef kanalı kontrol edin...")
-    await transfer_content(context.application, is_test=True)
+    # is_test=True olarak ana fonksiyonu çağır
+    await transfer_content(context, is_test=True)
     await update.message.reply_text("Test paylaşım işlemi tamamlandı.")
 
 
-# --- 6. ZAMANLAYICI BAŞLATMA ---
+# --- 6. ZAMANLAYICI BAŞLATMA (JobQueue ile) ---
 
-def start_scheduler(application: Application):
-    """APScheduler'ı kurar ve paylaşım görevini global zamanlayıcıya ekler."""
+def start_job_queue(application: Application):
+    """Her dakika çalışacak işi (JobQueue) kurar."""
     
-    # Önceki işleri temizle (Yeniden başlatma döngüsü ve RuntimeError çözümü için)
-    global_scheduler.remove_all_jobs() 
+    job_queue: JobQueue = application.job_queue
+    
+    # 1. Önceki işi kaldır (Yeniden dağıtımda hata vermesini engeller)
+    if job_queue.get_jobs_by_name("hourly_transfer_checker"):
+        job_queue.get_jobs_by_name("hourly_transfer_checker")[0].schedule_removal()
 
-    # *** SyntaxError'ı önlemek için add_job çağrısı en sade şekilde. ***
-    global_scheduler.add_job(
-        transfer_content, 
-        'cron', 
-        hour='12-18', 
-        minute=0, 
-        args=[application], 
-        id='hourly_transfer', 
-        replace_existing=True
+    # 2. Her dakika çalışacak işi ekle
+    job_queue.run_repeating(
+        callback=transfer_content, 
+        interval=60, # 60 saniyede (1 dakikada) bir çalıştır
+        first=0, # Bot başlar başlamaz çalıştır
+        name="hourly_transfer_checker",
     )
     
-    logger.info("Zamanlayıcı görev eklendi: Her saat başı 12:00-18:00 arası.")
-    
-    # Zamanlayıcıyı başlat
-    if not global_scheduler.running:
-        global_scheduler.start()
-        logger.info("Zamanlayıcı başlatıldı.")
+    logger.info("Dakikalık zamanlayıcı (JobQueue) kuruldu. Her dakika saat kontrolü yapılacak.")
 
 
 # --- 7. ANA ÇALIŞTIRMA FONKSİYONU ---
@@ -171,12 +160,12 @@ def main():
     application.add_handler(CommandHandler("test_paylasim", test_paylasim_command))
 
     # Zamanlayıcıyı başlat
-    start_scheduler(application)
+    start_job_queue(application)
 
     logger.info("✅ Bot çalışıyor ve Polling başlıyor...")
-    # Polling başlatılıyor. Bu, asyncio event loop'unu çalıştırır (RuntimeError'ı çözer).
+    # Polling başlatılıyor. Bu, botun sürekli çalışmasını ve JobQueue'nun tetiklenmesini sağlar.
     application.run_polling(poll_interval=1)
 
 if __name__ == "__main__":
     main()
-        
+                  
